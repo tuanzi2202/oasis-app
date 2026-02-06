@@ -3,8 +3,9 @@ import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:url_launcher/url_launcher.dart';
 import 'package:flutter_staggered_grid_view/flutter_staggered_grid_view.dart';
+import 'package:shared_preferences/shared_preferences.dart'; // 核心：本地存储库
 
-// ✨ 配置你的电脑 IP 地址 (模拟器无法访问 localhost)
+// ✨ 请确保这里是你的 Vercel 域名，不要带结尾的 /
 const String API_BASE_URL = "https://abc1206.vercel.app/api/mobile"; 
 
 void main() {
@@ -58,7 +59,7 @@ class _MainScreenState extends State<MainScreen> with SingleTickerProviderStateM
     try {
       final response = await http.get(Uri.parse('$API_BASE_URL/data'));
       if (response.statusCode == 200) {
-        final json = jsonDecode(response.body);
+        final json = jsonDecode(utf8.decode(response.bodyBytes));
         if (json['success']) {
           setState(() {
             _links = json['data']['links'];
@@ -68,6 +69,8 @@ class _MainScreenState extends State<MainScreen> with SingleTickerProviderStateM
             _isLoading = false;
           });
         }
+      } else {
+        setState(() => _isLoading = false);
       }
     } catch (e) {
       debugPrint("Error fetching data: $e");
@@ -85,7 +88,7 @@ class _MainScreenState extends State<MainScreen> with SingleTickerProviderStateM
               children: [
                 LinksPage(links: _links, categories: _categories, announcement: _announcement),
                 NotesPage(notes: _notes),
-                const ChatPage(),
+                const ChatPage(), // 这里的 ChatPage 已经是新版了
               ],
             ),
       bottomNavigationBar: Container(
@@ -226,7 +229,7 @@ class NotesPage extends StatelessWidget {
             padding: const EdgeInsets.all(16),
             decoration: BoxDecoration(
               color: bgColor,
-              borderRadius: BorderRadius.circular(4), // 模仿便利贴的方角
+              borderRadius: BorderRadius.circular(4),
               boxShadow: const [BoxShadow(color: Colors.black26, blurRadius: 4, offset: Offset(2, 2))],
             ),
             child: Column(
@@ -234,7 +237,7 @@ class NotesPage extends StatelessWidget {
               children: [
                 Text(
                   note['content'],
-                  style: TextStyle(color: Colors.brown.shade900, fontSize: 14, height: 1.4, fontFamily: 'monospace'), // 假设手写体
+                  style: TextStyle(color: Colors.brown.shade900, fontSize: 14, height: 1.4, fontFamily: 'monospace'),
                 ),
                 const SizedBox(height: 10),
                 Text(
@@ -250,7 +253,7 @@ class NotesPage extends StatelessWidget {
   }
 }
 
-// --- 3. AI 对话页面 ---
+// --- 3. AI 对话页面 (支持自定义API) ---
 class ChatPage extends StatefulWidget {
   const ChatPage({super.key});
   @override
@@ -262,8 +265,55 @@ class _ChatPageState extends State<ChatPage> {
     {'role': 'assistant', 'content': '嘿！我是 Haru，今天想聊点什么？'}
   ];
   final TextEditingController _inputController = TextEditingController();
+  final ScrollController _scrollController = ScrollController();
   bool _isThinking = false;
 
+  // --- 自定义配置状态 ---
+  bool _useCustomApi = false;
+  String _customApiUrl = "https://api.openai.com/v1/chat/completions";
+  String _customApiKey = "";
+  String _customModel = "gpt-3.5-turbo";
+
+  @override
+  void initState() {
+    super.initState();
+    _loadSettings();
+  }
+
+  // 加载本地配置
+  Future<void> _loadSettings() async {
+    final prefs = await SharedPreferences.getInstance();
+    setState(() {
+      _useCustomApi = prefs.getBool('useCustomApi') ?? false;
+      _customApiUrl = prefs.getString('customApiUrl') ?? "https://api.openai.com/v1/chat/completions";
+      _customApiKey = prefs.getString('customApiKey') ?? "";
+      _customModel = prefs.getString('customModel') ?? "gpt-3.5-turbo";
+    });
+  }
+
+  // 保存配置
+  Future<void> _saveSettings() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('useCustomApi', _useCustomApi);
+    await prefs.setString('customApiUrl', _customApiUrl);
+    await prefs.setString('customApiKey', _customApiKey);
+    await prefs.setString('customModel', _customModel);
+  }
+
+  // 滚动到底部
+  void _scrollToBottom() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_scrollController.hasClients) {
+        _scrollController.animateTo(
+          _scrollController.position.maxScrollExtent,
+          duration: const Duration(milliseconds: 300),
+          curve: Curves.easeOut,
+        );
+      }
+    });
+  }
+
+  // 发送消息核心逻辑
   Future<void> _sendMessage() async {
     final text = _inputController.text.trim();
     if (text.isEmpty) return;
@@ -273,27 +323,158 @@ class _ChatPageState extends State<ChatPage> {
       _isThinking = true;
       _inputController.clear();
     });
+    _scrollToBottom();
 
     try {
-      final response = await http.post(
-        Uri.parse('$API_BASE_URL/chat'),
-        headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({'message': text}),
-      );
+      String reply = "";
 
-      if (response.statusCode == 200) {
-        final json = jsonDecode(utf8.decode(response.bodyBytes));
-        setState(() {
-          _messages.add({'role': 'assistant', 'content': json['reply']});
-        });
+      if (_useCustomApi && _customApiKey.isNotEmpty) {
+        // ✨ 模式 A: 自定义 API
+        reply = await _fetchCustomApi(text);
+      } else {
+        // ✨ 模式 B: 默认服务器
+        reply = await _fetchServerApi(text);
       }
+
+      setState(() {
+        _messages.add({'role': 'assistant', 'content': reply});
+      });
     } catch (e) {
       setState(() {
         _messages.add({'role': 'system', 'content': '连接失败: $e'});
       });
     } finally {
       setState(() => _isThinking = false);
+      _scrollToBottom();
     }
+  }
+
+  // 调用 Next.js 后端
+  Future<String> _fetchServerApi(String text) async {
+    final response = await http.post(
+      Uri.parse('$API_BASE_URL/chat'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({'message': text}),
+    );
+
+    if (response.statusCode == 200) {
+      final json = jsonDecode(utf8.decode(response.bodyBytes));
+      return json['reply'];
+    } else {
+      throw Exception('Server error: ${response.statusCode}');
+    }
+  }
+
+  // 调用自定义 API (OpenAI 格式)
+  Future<String> _fetchCustomApi(String text) async {
+    try {
+      final response = await http.post(
+        Uri.parse(_customApiUrl),
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer $_customApiKey',
+        },
+        body: jsonEncode({
+          'model': _customModel,
+          'messages': [
+            // 保持和网页端一致的人设
+            {'role': 'system', 'content': '你是一个可爱的看板娘Haru，说话简短有趣，带点傲娇。'},
+            ..._messages.map((m) => {'role': m['role'] == 'system' ? 'assistant' : m['role'], 'content': m['content']}).toList().take(10),
+            {'role': 'user', 'content': text}
+          ],
+          'temperature': 0.7,
+        }),
+      );
+
+      if (response.statusCode == 200) {
+        final json = jsonDecode(utf8.decode(response.bodyBytes));
+        return json['choices'][0]['message']['content'];
+      } else {
+        throw Exception('API Error: ${response.body}');
+      }
+    } catch (e) {
+      throw Exception('自定义接口请求失败: $e');
+    }
+  }
+
+  // 弹出设置窗口
+  void _showSettingsDialog() {
+    final urlCtrl = TextEditingController(text: _customApiUrl);
+    final keyCtrl = TextEditingController(text: _customApiKey);
+    final modelCtrl = TextEditingController(text: _customModel);
+    bool tempUseCustom = _useCustomApi;
+
+    showDialog(
+      context: context,
+      builder: (context) => StatefulBuilder(
+        builder: (context, setDialogState) => AlertDialog(
+          backgroundColor: const Color(0xFF1E293B),
+          title: const Text("Haru 设置", style: TextStyle(color: Colors.white)),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                SwitchListTile(
+                  title: const Text("使用自定义 API", style: TextStyle(color: Colors.white, fontSize: 14)),
+                  value: tempUseCustom,
+                  activeColor: const Color(0xFF0EA5E9),
+                  onChanged: (val) => setDialogState(() => tempUseCustom = val),
+                ),
+                if (tempUseCustom) ...[
+                  const SizedBox(height: 10),
+                  _buildTextField("API 地址 (URL)", urlCtrl, "https://..."),
+                  const SizedBox(height: 10),
+                  _buildTextField("API Key (sk-...)", keyCtrl, "sk-xxxxxx"),
+                  const SizedBox(height: 10),
+                  _buildTextField("模型名称 (Model)", modelCtrl, "gpt-3.5-turbo"),
+                ]
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text("取消", style: TextStyle(color: Colors.white54)),
+            ),
+            TextButton(
+              onPressed: () {
+                setState(() {
+                  _useCustomApi = tempUseCustom;
+                  _customApiUrl = urlCtrl.text.trim();
+                  _customApiKey = keyCtrl.text.trim();
+                  _customModel = modelCtrl.text.trim();
+                });
+                _saveSettings(); // 保存到本地
+                Navigator.pop(context);
+              },
+              child: const Text("保存", style: TextStyle(color: Color(0xFF0EA5E9))),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildTextField(String label, TextEditingController controller, String hint) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(label, style: const TextStyle(color: Colors.white70, fontSize: 12)),
+        const SizedBox(height: 4),
+        TextField(
+          controller: controller,
+          style: const TextStyle(color: Colors.white, fontSize: 13),
+          decoration: InputDecoration(
+            hintText: hint,
+            hintStyle: const TextStyle(color: Colors.white24),
+            filled: true,
+            fillColor: const Color(0xFF0F172A),
+            border: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: BorderSide.none),
+            contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+          ),
+        ),
+      ],
+    );
   }
 
   @override
@@ -301,13 +482,40 @@ class _ChatPageState extends State<ChatPage> {
     return SafeArea(
       child: Column(
         children: [
+          // 顶部栏
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+            decoration: const BoxDecoration(
+              border: Border(bottom: BorderSide(color: Colors.white10)),
+              color: Color(0xFF0F172A),
+            ),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                const Text("与 Haru 对话", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+                IconButton(
+                  icon: Icon(Icons.settings, color: _useCustomApi ? const Color(0xFF0EA5E9) : Colors.white54),
+                  onPressed: _showSettingsDialog,
+                ),
+              ],
+            ),
+          ),
+          
+          // 消息列表
           Expanded(
             child: ListView.builder(
+              controller: _scrollController,
               padding: const EdgeInsets.all(16),
               itemCount: _messages.length,
               itemBuilder: (context, index) {
                 final msg = _messages[index];
                 final isUser = msg['role'] == 'user';
+                final isSystem = msg['role'] == 'system';
+                
+                if (isSystem) {
+                  return Center(child: Padding(padding: const EdgeInsets.all(8.0), child: Text(msg['content']!, style: const TextStyle(color: Colors.redAccent, fontSize: 12))));
+                }
+
                 return Align(
                   alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,
                   child: Container(
@@ -327,7 +535,9 @@ class _ChatPageState extends State<ChatPage> {
               },
             ),
           ),
-          if (_isThinking) const Padding(padding: EdgeInsets.all(8.0), child: Text("Haru 正在输入...", style: TextStyle(color: Colors.white54, fontSize: 10))),
+          
+          // 输入框
+          if (_isThinking) const Padding(padding: EdgeInsets.all(8.0), child: Text("Haru 正在思考...", style: TextStyle(color: Colors.white54, fontSize: 10))),
           Container(
             padding: const EdgeInsets.all(8),
             decoration: const BoxDecoration(color: Color(0xFF1E293B)),
